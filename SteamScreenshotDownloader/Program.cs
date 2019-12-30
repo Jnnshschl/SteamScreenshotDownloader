@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.Cache;
 using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
@@ -21,19 +22,48 @@ namespace SteamScreenshotDownloader
             Url = url;
         }
 
-        public void DownloadImage(string filePath)
+        public bool DownloadImage(string filePath)
         {
             string imgPath = Path.Combine(filePath, $"{Id.ToString()}.jpg");
 
             if (!File.Exists(imgPath))
             {
-                using WebClient client = new WebClient();
+                try
+                {
+                    HttpClient client = new HttpClient();
+                    HttpResponseMessage response = client.GetAsync(Url).GetAwaiter().GetResult();
 
-                string content = client.DownloadString(Url);
-                string imageUrl = content.Split("actualmediactn")[1].Split("https://steamuserimages-a.akamaihd.net/ugc/")[1].Split("\"")[0];
-                imageUrl = $"https://steamuserimages-a.akamaihd.net/ugc/{imageUrl}";
-                client.DownloadFile(imageUrl, imgPath);
+                    if (response.IsSuccessStatusCode)
+                    {
+                        string content = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+                        string imageUrl = content.Split("actualmediactn")[1].Split("https://steamuserimages-a.akamaihd.net/ugc/")[1].Split("\"")[0];
+                        imageUrl = $"https://steamuserimages-a.akamaihd.net/ugc/{imageUrl}";
+
+                        response = client.GetAsync(imageUrl).GetAwaiter().GetResult();
+
+                        if (response.IsSuccessStatusCode)
+                        {
+                            using Stream stream = response.Content.ReadAsStreamAsync().GetAwaiter().GetResult();
+                            using FileStream fileStream = new FileInfo(imgPath).OpenWrite();
+
+                            stream.CopyToAsync(fileStream).GetAwaiter().GetResult();
+                            return true;
+                        }
+                    }
+                }
+                catch { }
             }
+            else
+            {
+                return true;
+            }
+
+            if (File.Exists(imgPath))
+            {
+                File.Delete(imgPath);
+            }
+
+            return false;
         }
 
         public override string ToString()
@@ -46,11 +76,22 @@ namespace SteamScreenshotDownloader
         {
             Console.Title = "Steam Screenshot Downloader";
 
-            ColorPrint($"Steam Screenshot Downloader ({typeof(Program).Assembly.GetName().Version})");
-            ColorPrint($"Insert Steam Account Names (comma seperated): ", ConsoleColor.White, false);
+            ColorPrint($"Steam Screenshot Downloader ", ConsoleColor.White, false);
+            ColorPrint($"{typeof(Program).Assembly.GetName().Version}", ConsoleColor.Cyan, true, false);
 
-            Console.ForegroundColor = ConsoleColor.Cyan;
-            string[] accounts = Console.ReadLine().Split(",", StringSplitOptions.RemoveEmptyEntries);
+            string[] accounts;
+
+            if (args.Length >= 1)
+            {
+                accounts = args[0].Split(",", StringSplitOptions.RemoveEmptyEntries);
+            }
+            else
+            {
+                ColorPrint($"Insert Steam Account Names (comma seperated): ", ConsoleColor.White, false);
+                Console.ForegroundColor = ConsoleColor.Cyan;
+                accounts = Console.ReadLine().Split(",", StringSplitOptions.RemoveEmptyEntries);
+                Console.ResetColor();
+            }
 
             foreach (string account in accounts)
             {
@@ -70,7 +111,18 @@ namespace SteamScreenshotDownloader
                         }
                     }
 
-                    DownloadScreenshots(accountUrl);
+                    string dataPath;
+                    if (args.Length >= 2 && Directory.Exists(args[1]))
+                    {
+                        dataPath = args[1];
+                    }
+                    else
+                    {
+                        string basePath = AppDomain.CurrentDomain.BaseDirectory;
+                        dataPath = Path.Combine(basePath, "screenshots", account.Trim());
+                    }
+
+                    DownloadScreenshots(accountUrl, dataPath);
                 }
                 else
                 {
@@ -78,14 +130,16 @@ namespace SteamScreenshotDownloader
                 }
             }
 
-            ColorPrint($"Press any key to exit...");
-            Console.ReadKey();
+            if (args.Length == 0)
+            {
+                ColorPrint($"Press any key to exit...");
+                Console.ReadKey();
+            }
         }
 
-        private static void DownloadScreenshots(string screenshotsUrl)
+        private static void DownloadScreenshots(string screenshotsUrl, string dataPath)
         {
             HttpClient httpClient = new HttpClient();
-
             string username = "";
 
             int currentPage = 1;
@@ -157,25 +211,35 @@ namespace SteamScreenshotDownloader
                 {
                     retryCount++;
                 }
-            } while (currentPage - 1 < nextPage && retryCount < 4);
+            } while (currentPage - 1 < nextPage && retryCount < 12);
 
             if (images.Count > 0)
             {
                 ColorPrint($"Downloading ", ConsoleColor.White, false);
                 ColorPrint($"{images.Count} ", ConsoleColor.Cyan, false, false);
-                ColorPrint($"images, this may take a while... ", ConsoleColor.White, true, false);
-
-                string basePath = AppDomain.CurrentDomain.BaseDirectory;
-                string dataPath = Path.Combine(basePath, "screenshots", username);
+                ColorPrint($"images, this may take a while...\n", ConsoleColor.White, true, false);
 
                 if (!Directory.Exists(dataPath))
                 {
                     Directory.CreateDirectory(dataPath);
                 }
 
+                int imageCount = images.Count;
+                int finishedImageCount = 0;
+                object progressLock = new object();
+
                 Parallel.ForEach(images, img =>
                 {
-                    img.DownloadImage(dataPath);
+                    while (!img.DownloadImage(dataPath))
+                    {
+                        Thread.Sleep(1000);
+                    };
+
+                    lock (progressLock)
+                    {
+                        finishedImageCount++;
+                        UpdateProgress(imageCount, finishedImageCount);
+                    };
                 });
 
                 ColorPrint($"Finished ", ConsoleColor.White, false);
@@ -185,6 +249,18 @@ namespace SteamScreenshotDownloader
             {
                 ColorPrint($"No images found...", ConsoleColor.Red);
             }
+        }
+
+        static void UpdateProgress(int imageCount, int finishedImageCount)
+        {
+            Console.SetCursorPosition(Console.CursorLeft, Console.CursorTop - 1);
+            ColorPrint($"Downloaded ", ConsoleColor.White, false);
+            ColorPrint($"{finishedImageCount}", ConsoleColor.Cyan, false, false);
+            ColorPrint($"/", ConsoleColor.White, false, false);
+            ColorPrint($"{imageCount} ", ConsoleColor.Green, false, false);
+            ColorPrint($"Images [", ConsoleColor.White, false, false);
+            ColorPrint($"{(int)((double)finishedImageCount / (double)imageCount * 100.0)}%", ConsoleColor.Green, false, false);
+            ColorPrint($"]", ConsoleColor.White, true, false);
         }
 
         static void ColorPrint(string msg, ConsoleColor color = ConsoleColor.White, bool endline = true, bool printprefix = true)
